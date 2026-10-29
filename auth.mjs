@@ -15,6 +15,9 @@ export function getAuthConfig(env = process.env) {
 const LOGIN_WINDOW_SECONDS = 30 * 60;
 const CLOCK_SKEW_SECONDS = 60;
 
+// Os registros abaixo não incluem senha, tokens, código OAuth, estado, cliente ou IP.
+function defaultOAuthAudit(event, reason='') { console.info(`[fraseado.oauth] ${event}${reason ? ` ${reason}` : ''}`); }
+
 function base64url(v) { return Buffer.from(v).toString('base64url'); }
 function sign(payload, secret) {
   const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
@@ -79,7 +82,7 @@ async function readForm(req, max=32768) {
   return new URLSearchParams(text);
 }
 
-export function createAuthRoutes(config, now=()=>Date.now()) {
+export function createAuthRoutes(config, now=()=>Date.now(), audit=defaultOAuthAudit) {
   const codes = new Map();
   const failed = new Map();
   const windowMs=15*60*1000;
@@ -90,14 +93,14 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
     return sign(payload, config.secret);
   }
   function readPendingRequest(signed) {
-    if (!signed) return { error:'Solicitação de autorização ausente. Refaça a conexão no ChatGPT.' };
+    if (!signed) return { error:'Solicitação de autorização ausente. Refaça a conexão no ChatGPT.', code:'request_missing' };
     const data = verify(signed, config.secret);
     if (!data || data.kind !== 'pending' || !Number.isInteger(data.iat) || !Number.isInteger(data.exp) ||
         data.exp - data.iat !== LOGIN_WINDOW_SECONDS || data.iat > now()/1000 + CLOCK_SKEW_SECONDS) {
-      return { error:'Solicitação de autorização inválida. Abra uma nova conexão no ChatGPT.' };
+      return { error:'Solicitação de autorização inválida. Abra uma nova conexão no ChatGPT.', code:'request_invalid' };
     }
     if (data.exp <= now()/1000 - CLOCK_SKEW_SECONDS) {
-      return { error:'O prazo de autorização terminou. Abra uma nova conexão no ChatGPT.' };
+      return { error:'O prazo de autorização terminou. Abra uma nova conexão no ChatGPT.', code:'request_expired' };
     }
     return { data };
   }
@@ -113,8 +116,8 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
       json(res,200,{issuer:config.origin,authorization_response_iss_parameter_supported:true,authorization_endpoint:`${config.origin}/oauth/authorize`,token_endpoint:`${config.origin}/oauth/token`,client_id_metadata_document_supported:true,token_endpoint_auth_methods_supported:['none'],code_challenge_methods_supported:['S256'],response_types_supported:['code'],grant_types_supported:['authorization_code'],scopes_supported:[config.scope]});return true;
     }
     if (req.method==='GET' && route==='/oauth/authorize') {
-      try { renderLogin(res,authorizeLogin(authorizeQuery(url.searchParams,config))); }
-      catch(e) {html(res,400,`<p>Solicitação de autorização inválida: ${escapeHtml(e.message)}</p>`);}
+      try { renderLogin(res,authorizeLogin(authorizeQuery(url.searchParams,config))); audit('authorize_started'); }
+      catch(e) {audit('authorize_rejected','invalid_query');html(res,400,`<p>Solicitação de autorização inválida: ${escapeHtml(e.message)}</p>`);}
       return true;
     }
     if (req.method==='POST' && route==='/oauth/authorize') {
@@ -122,13 +125,16 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
       try {
         const form = await readForm(req);
         const pending = readPendingRequest(form.get('request'));
-        if (pending.error) throw new Error(pending.error);
+        if (pending.error) { audit('login_rejected',pending.code); html(res,400,`<p>Não foi possível autorizar: ${escapeHtml(pending.error)} (código ${pending.code})</p>`); return true; }
         const data = pending.data;
-        const validated = authorizeQuery(new URLSearchParams({ client_id:data.client,redirect_uri:data.redirect,state:data.state,resource:data.resource,scope:data.scope,response_type:'code',code_challenge:data.challenge,code_challenge_method:'S256' }),config);
+        let validated;
+        try { validated = authorizeQuery(new URLSearchParams({ client_id:data.client,redirect_uri:data.redirect,state:data.state,resource:data.resource,scope:data.scope,response_type:'code',code_challenge:data.challenge,code_challenge_method:'S256' }),config); }
+        catch { audit('login_rejected','invalid_oauth_parameters');html(res,400,'<p>Não foi possível autorizar: parâmetros de conexão inválidos (código invalid_oauth_parameters).</p>'); return true; }
         const key = createHash('sha256').update(req.socket.remoteAddress||'').digest('hex');
         const recent=failed.get(key);
-        if (recent && recent.n>=6 && recent.since+windowMs>now()) {html(res,429,'<p>Muitas tentativas incorretas. Tente mais tarde.</p>');return true;}
+        if (recent && recent.n>=6 && recent.since+windowMs>now()) {audit('login_rejected','rate_limited');html(res,429,'<p>Muitas tentativas incorretas. Tente mais tarde (código rate_limited).</p>');return true;}
         if (!checkPassword(form.get('password'),config)) {
+          audit('login_rejected','bad_password');
           failed.set(key,{since:recent?.since||now(),n:(recent?.n||0)+1});
           renderLogin(res,form.get('request'),'Senha inválida.');return true;
         }
@@ -136,26 +142,32 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
         const code=randomBytes(32).toString('base64url');
         codes.set(createHash('sha256').update(code).digest('hex'),{...validated,until:now()+180000});
         const dest=new URL(validated.redirect);dest.searchParams.set('code',code);dest.searchParams.set('state',validated.state);dest.searchParams.set('iss',config.origin);
+        audit('login_authorized');
         res.writeHead(302,{Location:dest.toString(),'cache-control':'no-store','referrer-policy':'no-referrer'}).end();
-      } catch(e) {html(res,400,`<p>Não foi possível autorizar: ${escapeHtml(e.message)}</p>`);}
+      } catch(e) {audit('login_rejected','unexpected_error');html(res,400,'<p>Não foi possível autorizar: falha inesperada (código unexpected_error).</p>');}
       return true;
     }
     if (req.method==='POST' && route==='/oauth/token') {
       cleanup();
       try {
         const form=await readForm(req);
-        if (form.get('grant_type')!=='authorization_code') {json(res,400,{error:'unsupported_grant_type'});return true;}
+        if (form.get('grant_type')!=='authorization_code') {audit('token_rejected','unsupported_grant_type');json(res,400,{error:'unsupported_grant_type'});return true;}
         const key=createHash('sha256').update(form.get('code')||'').digest('hex');
         const data=codes.get(key);codes.delete(key);
+        if(!data){audit('token_rejected','code_unknown');json(res,400,{error:'invalid_grant'});return true;}
         const verifier=form.get('code_verifier')||'';
         const challenge=createHash('sha256').update(verifier).digest('base64url');
-        if (!data || data.until<now() || !/^[a-zA-Z0-9._~-]{43,128}$/.test(verifier) ||
-          data.challenge!==challenge || data.client!==form.get('client_id') ||
-          data.redirect!==form.get('redirect_uri') || data.resource!==(form.get('resource')||config.origin)) {json(res,400,{error:'invalid_grant'});return true;}
+        const reason = data.until<now() ? 'code_expired' :
+          !/^[a-zA-Z0-9._~-]{43,128}$/.test(verifier) || data.challenge!==challenge ? 'pkce_mismatch' :
+          data.client!==form.get('client_id') ? 'client_mismatch' :
+          data.redirect!==form.get('redirect_uri') ? 'redirect_mismatch' :
+          data.resource!==(form.get('resource')||config.origin) ? 'resource_mismatch' : '';
+        if(reason){audit('token_rejected',reason);json(res,400,{error:'invalid_grant'});return true;}
         const iat=Math.floor(now()/1000);
         const token=sign({iss:config.origin,sub:'fraseado-owner',aud:config.audience,iat,exp:iat+43200,kind:'access',scope:config.scope},config.secret);
+        audit('token_issued');
         json(res,200,{access_token:token,token_type:'Bearer',expires_in:43200,scope:config.scope});
-      }catch{json(res,400,{error:'invalid_request'});}return true;
+      }catch{audit('token_rejected','malformed_request');json(res,400,{error:'invalid_request'});}return true;
     }
     return false;
   };
