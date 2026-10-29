@@ -42,3 +42,48 @@ test('OAuth PKCE completa autorização, emite token válido e rejeita replay',a
   const bad=await fetch(`${base}/oauth/authorize?${new URLSearchParams({...Object.fromEntries(params),redirect_uri:'https://evil.example/cb'})}`);
   assert.equal(bad.status,400);
 });
+
+test('login continua válido após 11 minutos e expira após a janela configurada', async(t) => {
+  let clock=Date.now();
+  const server=createServer(async(req,res)=>{
+    const url=new URL(req.url, 'http://localhost');
+    if(!await createHandler(req,res,url)) res.writeHead(404).end();
+  });
+  const createHandler=createAuthRoutes(config,()=>clock);
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  t.after(()=>new Promise(r=>server.close(r)));
+  const base=`http://127.0.0.1:${server.address().port}`;
+  const verifier='test-verifier-1234567890123456789012345678901234567890';
+  const challenge=createHash('sha256').update(verifier).digest('base64url');
+  const params=new URLSearchParams({
+    client_id:'https://chatgpt.com/oauth/client.json',
+    redirect_uri:'https://chatgpt.com/connector_platform_oauth_redirect',
+    response_type:'code',code_challenge:challenge,code_challenge_method:'S256',
+    resource:config.origin,scope:'transcribe',state:'teste-expiracao'
+  });
+  async function issueRequest() {
+    const res=await fetch(`${base}/oauth/authorize?${params}`);
+    assert.equal(res.status,200);
+    return (await res.text()).match(/name="request" value="([^"]+)"/)[1];
+  }
+  async function postRequest(request,password=config.password) {
+    return fetch(`${base}/oauth/authorize`,{
+      method:'POST',body:new URLSearchParams({request,password}),redirect:'manual'
+    });
+  }
+  const signed=await issueRequest();
+  clock+=11*60*1000;
+  const wrong=await postRequest(signed,'senha-incorreta');
+  assert.equal(wrong.status,200);
+  assert.match(await wrong.text(),/Senha inválida/);
+  const correct=await postRequest(signed);
+  assert.equal(correct.status,302);
+  const fresh=await issueRequest();
+  clock+=32*60*1000;
+  const expired=await postRequest(fresh);
+  assert.equal(expired.status,400);
+  assert.match(await expired.text(),/prazo de autorização terminou/);
+  const altered=await postRequest(fresh.slice(0,-3)+'xxx');
+  assert.equal(altered.status,400);
+  assert.match(await altered.text(),/Solicitação de autorização inválida/);
+});
