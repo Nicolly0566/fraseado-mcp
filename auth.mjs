@@ -12,6 +12,9 @@ export function getAuthConfig(env = process.env) {
   return { origin, password, secret, audience: origin, scope: 'transcribe' };
 }
 
+const LOGIN_WINDOW_SECONDS = 30 * 60;
+const CLOCK_SKEW_SECONDS = 60;
+
 function base64url(v) { return Buffer.from(v).toString('base64url'); }
 function sign(payload, secret) {
   const header = base64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
@@ -21,7 +24,7 @@ function sign(payload, secret) {
   return `${partial}.${sig}`;
 }
 function verify(token, secret) {
-  if (typeof token !== 'string' || token.length > 8192) return null;
+  if (typeof token !== 'string' || token.length > 16384) return null;
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const expected = createHmac('sha256', secret).update(parts.slice(0,2).join('.')).digest();
@@ -67,7 +70,7 @@ function json(res, status, data, headers={}) {
 function html(res, code, body) {
   res.writeHead(code, { 'content-type':'text/html; charset=utf-8', 'cache-control':'no-store', 'content-security-policy':"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'", 'x-content-type-options': 'nosniff' }).end(body);
 }
-async function readForm(req, max=8192) {
+async function readForm(req, max=32768) {
   let text='';
   for await(const chunk of req) {
     text+=chunk.toString('utf8');
@@ -82,11 +85,24 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
   const windowMs=15*60*1000;
   function cleanup(){ for (const [k,v] of codes) if (v.until<now()) codes.delete(k); for (const [k,v] of failed) if (v.since+windowMs<now()) failed.delete(k); }
   function authorizeLogin(requestInfo) {
-    const payload = { ...requestInfo, kind:'pending', iat:Math.floor(now()/1000), exp:Math.floor(now()/1000)+600, nonce:randomBytes(16).toString('hex') };
+    const issuedAt = Math.floor(now()/1000);
+    const payload = { ...requestInfo, kind:'pending', iat:issuedAt, exp:issuedAt+LOGIN_WINDOW_SECONDS, nonce:randomBytes(16).toString('hex') };
     return sign(payload, config.secret);
   }
+  function readPendingRequest(signed) {
+    if (!signed) return { error:'Solicitação de autorização ausente. Refaça a conexão no ChatGPT.' };
+    const data = verify(signed, config.secret);
+    if (!data || data.kind !== 'pending' || !Number.isInteger(data.iat) || !Number.isInteger(data.exp) ||
+        data.exp - data.iat !== LOGIN_WINDOW_SECONDS || data.iat > now()/1000 + CLOCK_SKEW_SECONDS) {
+      return { error:'Solicitação de autorização inválida. Abra uma nova conexão no ChatGPT.' };
+    }
+    if (data.exp <= now()/1000 - CLOCK_SKEW_SECONDS) {
+      return { error:'O prazo de autorização terminou. Abra uma nova conexão no ChatGPT.' };
+    }
+    return { data };
+  }
   function renderLogin(res, signed, message=''){
-    html(res,200,`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Conectar Fraseado</title><style>body{font:16px system-ui;margin:10vh auto;max-width:420px;padding:20px;color:#18202d}input,button{font:inherit;box-sizing:border-box;width:100%;padding:14px;border-radius:9px;margin-top:9px}input{border:1px solid #aaa}button{border:0;background:#d95c1e;color:#fff;cursor:pointer}small{color:#555}.error{color:#b42318}</style><h1>Conectar Fraseado</h1><p>Digite a senha de acesso particular definida no Render. Ela não é a chave da API Groq.</p>${message?`<p class="error">${escapeHtml(message)}</p>`:''}<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escapeHtml(signed)}"><label for="password">Senha de acesso</label><input name="password" id="password" type="password" autocomplete="current-password" minlength="16" required><button type="submit">Autorizar o Fraseado</button></form><p><small>Somente continue se você iniciou esta conexão no ChatGPT.</small></p></html>`);
+    html(res,200,`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Conectar Fraseado</title><style>body{font:16px system-ui;margin:10vh auto;max-width:420px;padding:20px;color:#18202d}input,button{font:inherit;box-sizing:border-box;width:100%;padding:14px;border-radius:9px;margin-top:9px}input{border:1px solid #aaa}button{border:0;background:#d95c1e;color:#fff;cursor:pointer}small{color:#555}.error{color:#b42318}</style><h1>Conectar Fraseado</h1><p>Digite a senha de acesso particular definida no Render. Ela não é a chave da API Groq.</p>${message?`<p class="error">${escapeHtml(message)}</p>`:''}<form method="post" action="/oauth/authorize"><input type="hidden" name="request" value="${escapeHtml(signed)}"><label for="password">Senha de acesso</label><input name="password" id="password" type="password" autocomplete="current-password" minlength="16" required><button type="submit">Autorizar o Fraseado</button></form><p><small>Esta autorização é válida por 30 minutos. Só continue se iniciou a conexão no ChatGPT.</small></p></html>`);
   }
   return async function handleAuth(req,res,url) {
     const route = url.pathname;
@@ -105,8 +121,9 @@ export function createAuthRoutes(config, now=()=>Date.now()) {
       cleanup();
       try {
         const form = await readForm(req);
-        const data = verify(form.get('request'),config.secret);
-        if (!data || data.kind!=='pending' || data.iat>now()/1000 || data.exp<=now()/1000) throw new Error('Solicitação expirada. Reinicie a conexão.');
+        const pending = readPendingRequest(form.get('request'));
+        if (pending.error) throw new Error(pending.error);
+        const data = pending.data;
         const validated = authorizeQuery(new URLSearchParams({ client_id:data.client,redirect_uri:data.redirect,state:data.state,resource:data.resource,scope:data.scope,response_type:'code',code_challenge:data.challenge,code_challenge_method:'S256' }),config);
         const key = createHash('sha256').update(req.socket.remoteAddress||'').digest('hex');
         const recent=failed.get(key);
