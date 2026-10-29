@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fraseado — Transcrição</title>
+  <style>
+    :root { color-scheme: light; --ink:#18202d; --muted:#667085; --orange:#d95c1e; --outline:#e5e7eb; --bg:#f8fafc; --surface:white; }
+    * { box-sizing:border-box; } body {margin:0;color:var(--ink);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);} main {max-width:860px;margin:0 auto;padding:20px;} header {display:flex;align-items:center;gap:12px;margin:0 0 18px;} .mark {background:#fff0e8;color:var(--orange);border-radius:12px;padding:12px;font-size:22px;} h1{font-size:22px;margin:0;} h2{font-size:16px;margin:0 0 12px;} .sub{color:var(--muted);margin:2px 0 0;font-size:13px;} .panel{background:var(--surface);border:1px solid var(--outline);border-radius:14px;padding:18px;margin-bottom:14px;} label{display:block;font-size:13px;font-weight:600;margin-bottom:8px;} input[type=file]{width:100%;padding:18px;border:2px dashed #f3c6af;border-radius:12px;background:#fff9f5;cursor:pointer;} textarea{display:block;width:100%;resize:vertical;min-height:120px;padding:12px;border:1px solid #cfd4dd;border-radius:10px;color:var(--ink);font:inherit;background:#fff;} #transcription{min-height:250px;} audio,video{display:block;width:100%;margin-top:12px;max-height:210px;} .line{display:flex;gap:10px;flex-wrap:wrap;align-items:center;} button{cursor:pointer;background:#fff;border:1px solid #cfd4dd;border-radius:9px;color:#253044;padding:9px 13px;font-weight:650;font:inherit;} button.primary{background:var(--orange);border-color:var(--orange);color:#fff;} button:disabled{opacity:.45;cursor:not-allowed;} .meter{margin-left:auto;color:var(--muted);font-size:12px;} .status{margin:12px 0 0;color:var(--muted);min-height:1.5em;} .status.error{color:#b42318;} .hidden{display:none!important;} .chip{display:inline-block;font-size:12px;border-radius:99px;background:#fff2e8;color:#ad4b17;padding:3px 8px;margin:8px 0 0;} #metrics{margin-top:10px;color:var(--muted);font-size:13px;} .foot{color:var(--muted);font-size:12px;margin:8px 0 0;} .cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;} @media(max-width:650px){.cols{grid-template-columns:1fr}.meter{margin-left:0;width:100%;}}
+  </style>
+</head>
+<body>
+<main>
+  <header><div class="mark" aria-hidden="true">▥</div><div><h1>Fraseado</h1><p class="sub">Transforme seus áudios em texto, com espaço para revisão.</p></div></header>
+  <section class="panel">
+    <h2>1. Escolha o arquivo</h2>
+    <label for="audioFile">Áudio ou vídeo (MP3, MP4, M4A, WAV, WEBM, OGG ou FLAC)</label>
+    <input id="audioFile" type="file" accept=".mp3,.mp4,.m4a,.wav,.webm,.ogg,.flac,audio/*,video/mp4" />
+    <span id="fileInfo" class="chip hidden"></span>
+    <audio id="previewAudio" controls class="hidden"></audio>
+    <video id="previewVideo" controls class="hidden"></video>
+    <div class="line" style="margin-top:14px"><button id="libraryButton" class="hidden">Escolher da biblioteca</button></div>
+    <label for="vocab" style="margin-top:16px">Termos e nomes específicos (opcional)</label>
+    <textarea id="vocab" rows="2" style="min-height:70px" placeholder="Ex.: SEPLAN, COPLAN, SIGEF, nomes de pessoas..." maxlength="2000"></textarea>
+    <div class="line" style="margin-top:14px"><button id="transcribeButton" class="primary" disabled>Transcrever arquivo</button><span id="waiting" class="meter">Nenhum arquivo escolhido</span></div>
+    <p id="status" class="status" role="status" aria-live="polite">A transcrição usa o Whisper Large V3 na cota gratuita do Groq; há limites de tamanho e uso.</p>
+  </section>
+  <section id="editorPanel" class="panel">
+    <div class="line" style="justify-content:space-between"><h2>2. Revise a transcrição</h2><span id="count" class="sub">0 palavras</span></div>
+    <textarea id="transcription" placeholder="O texto transcrito aparecerá aqui. Você também pode escrever e editar manualmente."></textarea>
+    <div class="line" style="margin-top:12px"><button id="copyButton">Copiar texto</button><button id="txtButton">Exportar .txt</button><button id="mdButton">Exportar .md</button><button id="clearButton">Limpar</button></div>
+  </section>
+  <section class="panel">
+    <h2>3. Verificação de precisão (opcional)</h2>
+    <p class="sub">Cole uma transcrição humana de referência. O índice será calculado por comparação de palavras; não é uma nota estimada pela IA.</p>
+    <label for="reference" style="margin-top:13px">Texto de referência</label>
+    <textarea id="reference" rows="3" placeholder="Cole aqui a transcrição conferida..."></textarea>
+    <div id="metrics">Adicione uma referência para medir a taxa de acerto.</div>
+  </section>
+  <p class="foot">O conteúdo não é salvo permanentemente neste widget. No plano gratuito do Groq, há limite de uso por hora e por dia. O servidor usa arquivos temporários para processar a transcrição. Confira nomes próprios e dados importantes no áudio original.</p>
+</main>
+<script>
+(function(){
+  const $ = (id) => document.getElementById(id);
+  const fileInput = $('audioFile'); const transcribe = $('transcribeButton');
+  const editor = $('transcription'); const status = $('status');
+  const supported = /\.(mp3|mp4|m4a|wav|webm|ogg|flac)$/i;
+  let activeFile = null; let libraryFile = null; let currentObjectUrl = null; let busy = false;
+  const host = () => window.openai;
+  function setStatus(message, error=false){ status.textContent=message; status.classList.toggle('error',error); }
+  function words(t){return (t.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)||[]);}
+  function updateMetrics(){
+    $('count').textContent=`${words(editor.value).length} palavras`;
+    const a=words($('reference').value),b=words(editor.value);
+    if (!a.length){$('metrics').textContent='Adicione uma referência para medir a taxa de acerto.';return;}
+    let previous=Array.from({length:b.length+1},(_,j)=>j);
+    for (let i=1;i<=a.length;i++){
+      let current=new Array(b.length+1);current[0]=i;
+      for(let j=1;j<=b.length;j++) current[j]=Math.min(current[j-1]+1,previous[j]+1,previous[j-1]+(a[i-1]===b[j-1]?0:1));
+      previous=current;
+    }
+    const errors=previous[b.length], wer=errors/a.length, accuracy=Math.max(0,1-wer)*100;
+    $('metrics').textContent=`Acurácia de palavras: ${accuracy.toFixed(2).replace('.',',')}% | WER: ${(wer*100).toFixed(2).replace('.',',')}% | ${errors} operações de erro / ${a.length} palavras de referência.`;
+  }
+  editor.addEventListener('input', updateMetrics); $('reference').addEventListener('input',updateMetrics);
+  function updateSelection(name,bytes){
+    const ok=supported.test(name);
+    $('fileInfo').textContent=`${name}${bytes? ' · '+(bytes/1024/1024).toFixed(1).replace('.',',')+' MB':''}`;
+    $('fileInfo').classList.remove('hidden');
+    transcribe.disabled=!ok||busy;
+    $('waiting').textContent=ok?'Pronto para transcrever':'Formato não suportado';
+    setStatus(ok?'Arquivo selecionado. Clique em “Transcrever arquivo”.':'Escolha um arquivo de áudio ou MP4.',!ok);
+  }
+  fileInput.addEventListener('change',()=>{
+    activeFile=fileInput.files?.[0]||null;libraryFile=null;
+    if(currentObjectUrl)URL.revokeObjectURL(currentObjectUrl);
+    $('previewAudio').classList.add('hidden');$('previewVideo').classList.add('hidden');
+    if(!activeFile){$('fileInfo').classList.add('hidden');transcribe.disabled=true;return;}
+    updateSelection(activeFile.name,activeFile.size);
+    if(!supported.test(activeFile.name))return;
+    currentObjectUrl=URL.createObjectURL(activeFile);
+    const player=activeFile.name.toLowerCase().endsWith('.mp4') ? $('previewVideo') : $('previewAudio');
+    player.src=currentObjectUrl;player.classList.remove('hidden');
+  });
+  if(host()?.selectFiles){
+    $('libraryButton').classList.remove('hidden');
+    $('libraryButton').addEventListener('click',async()=>{
+      try{
+        const files=await host().selectFiles();
+        const selected=files?.[0];if(!selected)return;
+        activeFile=null;libraryFile=selected;fileInput.value='';
+        if(currentObjectUrl)URL.revokeObjectURL(currentObjectUrl);
+        $('previewAudio').classList.add('hidden');$('previewVideo').classList.add('hidden');
+        updateSelection(selected.fileName||'audio.mp3',0);
+      }catch(e){setStatus('Não foi possível selecionar o arquivo: '+e.message,true);}
+    });
+  }
+  transcribe.addEventListener('click',async()=>{
+    if(busy||(!activeFile&&!libraryFile))return;
+    if(!host()?.callTool||!host()?.getFileDownloadUrl){setStatus('Abra o Fraseado como aplicativo integrado ao ChatGPT para transcrever.',true);return;}
+    busy=true;transcribe.disabled=true;$('waiting').textContent='Processando…';
+    try{
+      setStatus('Enviando e transcrevendo. Aguarde o processamento desta solicitação…');
+      const name=activeFile?.name||libraryFile?.fileName||'audio.mp3';
+      const uploaded=activeFile?await host().uploadFile(activeFile):{fileId:libraryFile.fileId};
+      if(!uploaded?.fileId)throw new Error('O ChatGPT não retornou um identificador de arquivo.');
+      const urlInfo=await host().getFileDownloadUrl({fileId:uploaded.fileId});
+      if(!urlInfo?.downloadUrl)throw new Error('Não foi possível obter o link temporário de leitura.');
+      const result=await host().callTool('transcrever_audio',{arquivo:{download_url:urlInfo.downloadUrl,file_id:uploaded.fileId,mime_type:activeFile?.type||libraryFile?.mimeType||'application/octet-stream',file_name:name},vocabulario:$('vocab').value});
+      const data=result?.structuredContent||result?.structured_content||{};
+      if(result?.isError||data.sucesso===false)throw new Error(data.erro||'O servidor não concluiu a transcrição.');
+      if(typeof data.texto!=='string')throw new Error('A transcrição não retornou um texto válido.');
+      editor.value=data.texto; updateMetrics();setStatus(`Transcrição concluída: ${data.trechos||1} trecho(s). Revise o texto com o áudio.`);
+    }catch(e){setStatus('Falha na transcrição: '+(e?.message||'erro desconhecido'),true);}
+    finally{busy=false;transcribe.disabled=!(activeFile||libraryFile);$('waiting').textContent='Pronto para transcrever';}
+  });
+  $('copyButton').addEventListener('click',async()=>{
+    try{await navigator.clipboard.writeText(editor.value);setStatus('Texto copiado.');}
+    catch{editor.select();document.execCommand('copy');setStatus('Texto selecionado para copiar.');}
+  });
+  function save(ext){const blob=new Blob([editor.value],{type:'text/plain;charset=utf-8'});const url=URL.createObjectURL(blob);const anchor=document.createElement('a');anchor.href=url;anchor.download='fraseado-transcricao.'+ext;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),2500);}
+  $('txtButton').addEventListener('click',()=>save('txt'));
+  $('mdButton').addEventListener('click',()=>save('md'));
+  $('clearButton').addEventListener('click',()=>{editor.value='';$('reference').value='';updateMetrics();setStatus('Editor limpo.');});
+})();
+</script>
+</body>
+</html>

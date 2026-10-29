@@ -1,0 +1,12 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { validateFile, normalizeVocabulary, joinTranscripts } from '../audio.mjs';
+const hosts = new Set(['files.oaiusercontent.com']);
+const data = { file_id: 'file_abc', file_name: 'gravação.mp4', download_url: 'https://files.oaiusercontent.com/abc?sig=xyz' };
+test('valida MP4 com URL temporária autorizada', () => assert.equal(validateFile(data, hosts).name, data.file_name));
+test('bloqueia HTTP inseguro', () => assert.throws(() => validateFile({ ...data, download_url: 'http://files.oaiusercontent.com/x' }, hosts)));
+test('bloqueia SSRF com host externo', () => assert.throws(() => validateFile({ ...data, download_url: 'https://127.0.0.1/' }, hosts)));
+test('bloqueia redirecionamento por nome de host falso', () => assert.throws(() => validateFile({ ...data, download_url: 'https://files.oaiusercontent.com.evil.org/' }, hosts)));
+test('bloqueia formatos inválidos', () => assert.throws(() => validateFile({ ...data, file_name: 'foo.exe' }, hosts)));
+test('sanitiza vocabulário', () => assert.deepEqual(normalizeVocabulary('UFRN;SEPLAN,<script>\nPPA'), ['UFRN', 'SEPLAN', 'script', 'PPA']));
+test('une transcrições', () => assert.equal(joinTranscripts([' Olá. ', ' Tudo bem? ']), 'Olá.\n\nTudo bem?'));
